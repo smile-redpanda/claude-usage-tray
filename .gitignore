@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+
+# PyInstaller output (rebuild with build_exe.ps1)
+build/
+dist/

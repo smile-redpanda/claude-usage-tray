@@ -1,0 +1,4 @@
+pystray==0.19.5
+pillow==12.3.0
+# Only for build_exe.ps1 (the single-file .exe)
+pyinstaller==6.22.3
