@@ -67,6 +67,7 @@ ICON_GAP = "\u2009"
 LEADING_ZEROS_COLOR = "#5a5a5a"
 # The two weekly bars above the text, each split into 7 day segments.
 WEEKLY_PART_COUNT = 7
+FIVE_HOUR_PART_COUNT = 5  # the time-left and usage-left bars below the text: an hour / 20% per segment
 WEEKLY_LEFT_FULL_DAY_COLOR = "#d97757"  # Claude orange: a whole day's share of the weekly limit still left
 WEEKLY_LEFT_PART_DAY_COLOR = "#ffffff"  # white: the day's share that is partly used
 WEEKLY_EXPECTED_LEFT_FULL_DAY_COLOR = "#8a8a8a"  # gray: a whole day that should be left, in the bar above the text
@@ -387,49 +388,24 @@ def draw_icon_image(percent_used):
     return icon_image
 
 
-class ThinBar:
-    """A thin progress bar the width of the floating label: a filled part over a dark track."""
-
-    def __init__(self, tk_root, fill_color, gap_below_pixels=0):
-        self.fill_color = fill_color
-        self.filled_fraction = None
-        self.canvas = tkinter.Canvas(
-            tk_root,
-            width=1,  # let the text set the label's width; the bar stretches to match
-            height=BAR_HEIGHT_PIXELS,
-            background="#3a3a3a",
-            highlightthickness=0,
-            borderwidth=0,
-        )
-        self.canvas.pack(fill="x", pady=(0, gap_below_pixels))
-        self.filled_part = self.canvas.create_rectangle(0, 0, 0, BAR_HEIGHT_PIXELS, fill=fill_color, width=0)
-        self.canvas.bind("<Configure>", lambda event: self.redraw())
-
-    def show_fraction(self, filled_fraction, fill_color=None):
-        self.filled_fraction = filled_fraction
-        if fill_color is not None:
-            self.fill_color = fill_color
-        self.redraw()
-
-    def redraw(self):
-        fraction = 0 if self.filled_fraction is None else max(0.0, min(1.0, self.filled_fraction))
-        self.canvas.coords(self.filled_part, 0, 0, round(self.canvas.winfo_width() * fraction), BAR_HEIGHT_PIXELS)
-        self.canvas.itemconfigure(self.filled_part, fill=self.fill_color)
+# For SegmentBar's part_color: draw the part-filled segment in the full color too.
+SAME_AS_FULL_COLOR = "same as full"
 
 
-class SevenDaySegmentBar:
-    """A thin bar split into 7 day segments (with 1 px gaps), filled from the left: whole days in the full color, the
-    partly gone day in the part color, filled as far as it has left (not drawn when part_day_color is None). With
-    show_empty_track=False the empty parts are
-    not drawn (just the label background)."""
+class SegmentBar:
+    """A thin bar the width of the floating label, split into segment_count segments (1 px gaps), filled from the
+    left: whole segments in full_color, the part-filled one in part_color (not drawn when None), filled as far as it
+    goes. Empty parts show a dark track, or nothing with show_empty_track=False. Used for the weekly bars (7 days)
+    and the 5-hour bars (5 hours)."""
 
     def __init__(
-        self, tk_root, full_day_color, part_day_color, gap_below_pixels=0, show_empty_track=True,
-        height_pixels=BAR_HEIGHT_PIXELS,
+        self, tk_root, segment_count, full_color, part_color=SAME_AS_FULL_COLOR, gap_below_pixels=0,
+        show_empty_track=True, height_pixels=BAR_HEIGHT_PIXELS,
     ):
+        self.segment_count = segment_count
         self.show_empty_track = show_empty_track
-        self.full_day_color = full_day_color
-        self.part_day_color = part_day_color
+        self.full_color = full_color
+        self.part_color = part_color
         self.height_pixels = height_pixels
         self.filled_fraction = None
         self.canvas = tkinter.Canvas(
@@ -443,27 +419,35 @@ class SevenDaySegmentBar:
         self.canvas.pack(fill="x", pady=(0, gap_below_pixels))
         self.canvas.bind("<Configure>", lambda event: self.redraw())
 
-    def show_fraction(self, filled_fraction):
+    def show_fraction(self, filled_fraction, full_color=None):
+        """full_color changes the color (the usage bar turns orange / red)."""
         self.filled_fraction = filled_fraction
+        if full_color is not None:
+            self.full_color = full_color
         self.redraw()
 
     def redraw(self):
         self.canvas.delete("all")
         width = self.canvas.winfo_width()
-        days_left = 0 if self.filled_fraction is None else max(0.0, min(1.0, self.filled_fraction)) * WEEKLY_PART_COUNT
-        for day_number in range(WEEKLY_PART_COUNT):
-            left = round(width * day_number / WEEKLY_PART_COUNT)
-            right = round(width * (day_number + 1) / WEEKLY_PART_COUNT) - (1 if day_number < WEEKLY_PART_COUNT - 1 else 0)
+        part_color = self.full_color if self.part_color == SAME_AS_FULL_COLOR else self.part_color
+        segments_filled = (
+            0 if self.filled_fraction is None else max(0.0, min(1.0, self.filled_fraction)) * self.segment_count
+        )
+        for segment_number in range(self.segment_count):
+            left = round(width * segment_number / self.segment_count)
+            right = round(width * (segment_number + 1) / self.segment_count)
+            if segment_number < self.segment_count - 1:
+                right -= 1  # the gap
             if self.show_empty_track:
                 self.canvas.create_rectangle(left, 0, right, self.height_pixels, fill="#3a3a3a", width=0)
-            fraction_of_day_left = max(0.0, min(1.0, days_left - day_number))
-            if fraction_of_day_left >= 1:
-                color = self.full_day_color
-            elif fraction_of_day_left > 0 and self.part_day_color is not None:
-                color = self.part_day_color
+            fraction_of_segment_filled = max(0.0, min(1.0, segments_filled - segment_number))
+            if fraction_of_segment_filled >= 1:
+                color = self.full_color
+            elif fraction_of_segment_filled > 0 and part_color is not None:
+                color = part_color
             else:
                 continue
-            filled_right = left + round((right - left) * fraction_of_day_left)
+            filled_right = left + round((right - left) * fraction_of_segment_filled)
             self.canvas.create_rectangle(left, 0, filled_right, self.height_pixels, fill=color, width=0)
 
 
@@ -724,11 +708,11 @@ class FloatingUsageLabel:
         # Above the text, two weekly bars in 7 day segments: first (at the very top) the weekly limit left (Claude orange, the
         # partly used day white), then how much SHOULD be left by now, i.e. the time left until the weekly reset
         # (whole days only, in gray; the day in progress and empty parts are not drawn).
-        self.weekly_usage_left_bar = SevenDaySegmentBar(
-            tk_root, WEEKLY_LEFT_FULL_DAY_COLOR, WEEKLY_LEFT_PART_DAY_COLOR, gap_below_pixels=1
+        self.weekly_usage_left_bar = SegmentBar(
+            tk_root, WEEKLY_PART_COUNT, WEEKLY_LEFT_FULL_DAY_COLOR, WEEKLY_LEFT_PART_DAY_COLOR, gap_below_pixels=1
         )
-        self.weekly_expected_left_bar = SevenDaySegmentBar(
-            tk_root, WEEKLY_EXPECTED_LEFT_FULL_DAY_COLOR, part_day_color=None, show_empty_track=False,
+        self.weekly_expected_left_bar = SegmentBar(
+            tk_root, WEEKLY_PART_COUNT, WEEKLY_EXPECTED_LEFT_FULL_DAY_COLOR, part_color=None, show_empty_track=False,
             height_pixels=EXPECTED_BAR_HEIGHT_PIXELS,
         )
 
@@ -794,10 +778,11 @@ class FloatingUsageLabel:
         )
         self.login_button.bind("<Button-1>", lambda event: on_login_requested())
 
-        # Below the text, two bars: first time left (blue) in the 5-hour window, full at 5h left and empty at 0.
-        self.time_left_bar = ThinBar(tk_root, TIME_LEFT_COLOR, gap_below_pixels=1)
+        # Below the text, two bars in 5 segments (an hour / 20% each): first time left (blue) in the 5-hour window, full
+        # at 5h left and empty at 0.
+        self.time_left_bar = SegmentBar(tk_root, FIVE_HOUR_PART_COUNT, TIME_LEFT_COLOR, gap_below_pixels=1)
         # Then usage left at the very bottom, full when nothing is used and empty at 100%; green / orange / red by usage.
-        self.usage_left_bar = ThinBar(tk_root, "#bbbbbb")
+        self.usage_left_bar = SegmentBar(tk_root, FIVE_HOUR_PART_COUNT, "#bbbbbb")
 
         self.drag_start_offset = (0, 0)
         self.user_has_moved_label = False

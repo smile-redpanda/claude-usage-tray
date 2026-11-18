@@ -26,8 +26,9 @@ Remote: `https://github.com/ekkSoft/claude-usage-tray`. No tests or lint config.
 - 429 → wait the server's `Retry-After`. Fetching every 60 s got it rate limited for 9+ hours: keep ≥ 5 min.
 - Label (tkinter, borderless, topmost, bottom-right above the taskbar, draggable, right-click → Hide / Quit), top to
   bottom: a weekly-limit-left bar in 7 day segments (Claude orange #d97757, the partly used day white); a 7-day segment bar for how much SHOULD be left (time until the weekly reset:
-  whole days only, in gray: the day in progress and empty parts are not drawn; `SevenDaySegmentBar`); the text row
-  "⚡ 081% (03%)  ⏳ 03h43m (06m)  FIN"; a blue time-left bar; the usage-left bar (1 px gaps within each bar pair).
+  whole days only, in gray: the day in progress and empty parts are not drawn; `SegmentBar`); the text row
+  "⚡ 081% (03%)  ⏳ 03h43m (06m)  FIN"; a blue time-left bar and the usage-left bar, both in 5 segments (an hour / 20% each)
+  (1 px gaps within each bar pair).
   Numbers have a fixed length so the width never changes; each text sits in a fixed-size slot frame
   (`put_in_slot` / `set_slot_text`); leading zeros are drawn gray (`LeadingZerosGrayText`). No drop yet → gray
   "(00%)" / "(00s)" placeholders. Drop time is 2 digits + s/m/h.
