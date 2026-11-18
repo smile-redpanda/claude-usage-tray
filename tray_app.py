@@ -32,7 +32,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pystray
-from PIL import Image, ImageDraw, ImageFont
+import math
+
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 USAGE_JSON_FILE_PATH = Path.home() / ".claude" / "usage-watch.json"
 # One line per fetch, for the graph shown when hovering over the usage on the label.
@@ -78,7 +80,11 @@ ACCOUNT_BUTTON_HOVER_COLOR = "#4a4a4a"
 ACCOUNT_BUTTON_TEXT_COLOR = "#dddddd"
 ACCOUNT_LOGGED_OUT_TEXT_COLOR = "#ff6b6b"  # red: the account is signed out
 LOGIN_BUTTON_COLOR = "#3a6ea5"
-ALERT_TEXT_COLOR = "#ffb347"  # orange: a problem shown in the account panel
+MINI_CLOCK_SIZE_PIXELS = 100  # the mini clock's width and height at 100% Windows scaling
+MINI_CLOCK_RIM_COLOR = "#9a9a9a"  # light enough that the round clock stands out on dark windows
+DRAG_HANDLE_COLOR ="#5a5a5a"  # the grip of dots at the label's left end
+DRAG_HANDLE_HOVER_COLOR = "#cccccc"
+ALERT_TEXT_COLOR ="#ffb347"  # orange: a problem shown in the account panel
 ALERT_BACKGROUND_COLOR = "#3a2a14"
 FIVE_HOUR_WINDOW_MINUTES = 5 * 60
 STAY_ON_TOP_CHECK_MILLISECONDS = 250
@@ -703,11 +709,153 @@ class AccountPanel:
             ).grid(row=len(account_rows) + 1 + alert_number, column=0, columnspan=5, sticky="we", pady=(4, 0))
 
 
+def draw_mini_clock_image(
+    size_pixels, time_left_fraction, usage_left_fraction, usage_color, account_name, account_name_color
+):
+    """The minimized display: a round clock face whose full circle is the 5-hour window. Hour ticks (5) and 10-minute
+    ticks; the long blue needle points at the time left, the short one (usage color) at the usage left (a full turn =
+    100%); the account name in the middle. Drawn 4x larger and shrunk, so the
+    edges are smooth. Returns an RGBA image (transparent outside the circle)."""
+    supersample = 4
+    big_size = size_pixels * supersample
+    image = Image.new("RGBA", (big_size, big_size), (0, 0, 0, 0))
+    drawing = ImageDraw.Draw(image)
+    center = big_size / 2
+    radius = big_size / 2 - supersample
+
+    def point_at(angle_fraction, distance):
+        """Clockwise from 12 o'clock: angle_fraction 0..1 of a full turn."""
+        angle = angle_fraction * 2 * math.pi
+        return center + distance * math.sin(angle), center - distance * math.cos(angle)
+
+    # Two rings: Claude orange on the outside, then the light gray rim just inside it.
+    drawing.ellipse(
+        (center - radius, center - radius, center + radius, center + radius),
+        fill=WEEKLY_LEFT_FULL_DAY_COLOR,
+    )
+    orange_ring_width = 2 * supersample
+    drawing.ellipse(
+        (center - radius + orange_ring_width, center - radius + orange_ring_width,
+         center + radius - orange_ring_width, center + radius - orange_ring_width),
+        fill=LABEL_BACKGROUND_COLOR, outline=MINI_CLOCK_RIM_COLOR, width=2 * supersample,
+    )
+    # Ticks: every 10 minutes a short dim one, every hour a long bright one (300 minutes = a full turn).
+    for minute in range(0, FIVE_HOUR_WINDOW_MINUTES, 10):
+        is_hour = minute % 60 == 0
+        tick_length = radius * (0.16 if is_hour else 0.07)
+        drawing.line(
+            (point_at(minute / FIVE_HOUR_WINDOW_MINUTES, radius * 0.9 - tick_length),
+             point_at(minute / FIVE_HOUR_WINDOW_MINUTES, radius * 0.9)),
+            fill="#bbbbbb" if is_hour else "#5a5a5a", width=(2 if is_hour else 1) * supersample,
+        )
+
+    def draw_needle(fraction, length, color, width):
+        tip = point_at(max(0.0, min(1.0, fraction)), length)
+        drawing.line((center, center, *tip), fill=color, width=width)
+        tip_radius = width / 2
+        drawing.ellipse((tip[0] - tip_radius, tip[1] - tip_radius, tip[0] + tip_radius, tip[1] + tip_radius), fill=color)
+
+    if time_left_fraction is not None:
+        draw_needle(time_left_fraction, radius * 0.8, TIME_LEFT_COLOR, 3 * supersample)
+    if usage_left_fraction is not None:
+        draw_needle(usage_left_fraction, radius * 0.55, usage_color, 5 * supersample)
+
+    if account_name:
+        try:
+            name_font = ImageFont.truetype("segoeuib.ttf", round(radius * 0.3))
+        except OSError:
+            name_font = ImageFont.load_default()
+        drawing.text(
+            (center, center), account_name.upper(), font=name_font, anchor="mm", fill=account_name_color,
+            stroke_width=round(1.5 * supersample), stroke_fill=LABEL_BACKGROUND_COLOR,
+        )
+    return image.resize((size_pixels, size_pixels), Image.LANCZOS)
+
+
+class MiniClock:
+    """The minimized display: a round borderless always-on-top window showing draw_mini_clock_image. Drag it from
+    anywhere; a click without dragging calls on_click (back to the full label)."""
+
+    # The color Windows makes see-through, so only the round face shows. Nearly black, so the smoothed edge pixels
+    # (a mix of the face and this color) still look like part of the dark rim.
+    TRANSPARENT_COLOR = "#010101"
+
+    def __init__(self, tk_root, on_click, on_right_click, on_moved):
+        self.on_click = on_click
+        self.on_moved = on_moved
+        self.window = tkinter.Toplevel(tk_root)
+        self.window.withdraw()
+        self.window.overrideredirect(True)
+        self.window.attributes("-topmost", True)
+        self.window.attributes("-alpha", 0.9)
+        self.window.attributes("-transparentcolor", self.TRANSPARENT_COLOR)
+        self.size_pixels = round(MINI_CLOCK_SIZE_PIXELS * tk_root.winfo_fpixels("1i") / 96)
+        self.canvas = tkinter.Canvas(
+            self.window, width=self.size_pixels, height=self.size_pixels, background=self.TRANSPARENT_COLOR,
+            highlightthickness=0, borderwidth=0, cursor="fleur",
+        )
+        self.canvas.pack()
+        self.canvas_image = self.canvas.create_image(0, 0, anchor="nw")
+        self.photo_image = None  # keep a reference, or tkinter drops the picture
+        self.press_position = None
+        self.drag_start_offset = (0, 0)
+        self.is_dragging = False
+        self.canvas.bind("<ButtonPress-1>", self.on_press)
+        self.canvas.bind("<B1-Motion>", self.on_motion)
+        self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.canvas.bind("<Button-3>", on_right_click)
+        self.shown_drawing_inputs = None
+
+    def draw(self, time_left_fraction, usage_left_fraction, usage_color, account_name, account_name_color):
+        drawing_inputs = (
+            None if time_left_fraction is None else round(time_left_fraction, 3),
+            None if usage_left_fraction is None else round(usage_left_fraction, 3),
+            usage_color, account_name, account_name_color,
+        )
+        if drawing_inputs == self.shown_drawing_inputs:
+            return
+        self.shown_drawing_inputs = drawing_inputs
+        clock_image = draw_mini_clock_image(
+            self.size_pixels, time_left_fraction, usage_left_fraction, usage_color, account_name, account_name_color
+        )
+        # Flatten onto the see-through color (fully transparent pixels become see-through).
+        flattened_image = Image.new("RGBA", clock_image.size, self.TRANSPARENT_COLOR)
+        flattened_image.alpha_composite(clock_image)
+        self.photo_image = ImageTk.PhotoImage(flattened_image.convert("RGB"))
+        self.canvas.itemconfigure(self.canvas_image, image=self.photo_image)
+
+    def on_press(self, event):
+        self.press_position = (event.x_root, event.y_root)
+        self.drag_start_offset = (event.x_root - self.window.winfo_x(), event.y_root - self.window.winfo_y())
+        self.is_dragging = False
+
+    def on_motion(self, event):
+        if self.press_position is None:
+            return
+        if not self.is_dragging and (
+            abs(event.x_root - self.press_position[0]) + abs(event.y_root - self.press_position[1]) < 4
+        ):
+            return  # a small wobble during a click is not a drag
+        self.is_dragging = True
+        offset_x, offset_y = self.drag_start_offset
+        self.window.geometry(f"+{event.x_root - offset_x}+{event.y_root - offset_y}")
+        self.on_moved()
+
+    def on_release(self, event):
+        was_click = self.press_position is not None and not self.is_dragging
+        self.press_position = None
+        self.is_dragging = False
+        if was_click:
+            self.on_click()
+
+
 class FloatingUsageLabel:
-    """A small borderless always-on-top text window. Drag it with the left mouse button; right-click for a menu."""
+    """A small borderless always-on-top text window. Drag it by the grip of dots at its left end; right-click for a
+    menu."""
 
     def __init__(
-        self, tk_root, on_quit_requested, on_login_requested, on_account_button_clicked, read_graph_history_entries
+        self, tk_root, on_quit_requested, on_login_requested, on_account_button_clicked, read_graph_history_entries,
+        on_display_mode_changed=None,
     ):
         self.tk_root = tk_root
         self.read_graph_history_entries = read_graph_history_entries
@@ -748,6 +896,25 @@ class FloatingUsageLabel:
             account_button_part.bind("<Button-1>", lambda event: on_account_button_clicked())
             account_button_part.bind("<Enter>", lambda event: self.color_account_button(ACCOUNT_BUTTON_HOVER_COLOR))
             account_button_part.bind("<Leave>", lambda event: self.color_account_button(ACCOUNT_BUTTON_COLOR))
+        # At the left end: the drag handle, a dim grip of dots that lights up under the pointer. It is the only place
+        # the label can be dragged from (see the bindings below).
+        self.drag_handle = tkinter.Label(
+            text_row,
+            text="⠿",
+            font=("Segoe UI Symbol", 11),
+            foreground=DRAG_HANDLE_COLOR,
+            background=LABEL_BACKGROUND_COLOR,
+            cursor="fleur",
+            padx=2,
+        )
+        self.drag_handle.pack(side="left", padx=(0, 4))
+        self.drag_handle.bind(
+            "<Enter>", lambda event: self.drag_handle.configure(foreground=DRAG_HANDLE_HOVER_COLOR, background="#333333")
+        )
+        self.drag_handle.bind(
+            "<Leave>",
+            lambda event: self.drag_handle.configure(foreground=DRAG_HANDLE_COLOR, background=LABEL_BACKGROUND_COLOR),
+        )
         label_font = ("Segoe UI", 10, "bold")
         self.usage_percent_text = LeadingZerosGrayText(
             text_row, text="", font=label_font, foreground="#bbbbbb", background="#222222"
@@ -802,17 +969,19 @@ class FloatingUsageLabel:
         self.account_name_text.bind(
             "<Button-3>", lambda event: right_click_menu.tk_popup(event.x_root, event.y_root)
         )
-        for draggable_widget in (
+        # Only the handle drags the label; right-click anywhere on the text row opens the menu.
+        self.drag_handle.bind("<ButtonPress-1>", self.start_drag)
+        self.drag_handle.bind("<B1-Motion>", self.continue_drag)
+        for right_clickable_widget in (
+            self.drag_handle,
             text_row,
             self.time_left_text,
             self.time_of_last_drop_text,
             self.usage_percent_text,
             self.usage_last_drop_text,
-            *self.text_slot_frames.values(),  # the empty space inside a slot drags too
+            *self.text_slot_frames.values(),
         ):
-            draggable_widget.bind("<ButtonPress-1>", self.start_drag)
-            draggable_widget.bind("<B1-Motion>", self.continue_drag)
-            draggable_widget.bind(
+            right_clickable_widget.bind(
                 "<Button-3>", lambda event: right_click_menu.tk_popup(event.x_root, event.y_root)
             )
 
@@ -831,8 +1000,69 @@ class FloatingUsageLabel:
             self.graph_hover_widgets.add(hover_widget)
             self.graph_hover_widgets.update(getattr(hover_widget, "part_labels", []))
 
+        # Two display modes: this full label, or the round mini clock. Clicking the time ("⏳ 02h11m (06m)") shrinks
+        # to the clock; clicking the clock comes back. Both share one corner: switching keeps the bottom-right edge.
+        self.is_minimized = False
+        self.is_hidden = False
+        self.on_display_mode_changed = on_display_mode_changed
+        self.mini_clock = MiniClock(
+            tk_root,
+            on_click=self.switch_to_full_label,
+            on_right_click=lambda event: right_click_menu.tk_popup(event.x_root, event.y_root),
+            on_moved=self.note_moved_by_hand,
+        )
+        self.clock_inputs = {
+            "time_left_fraction": None, "usage_left_fraction": None, "usage_color": "#bbbbbb",
+            "account_name": "", "account_name_color": ACCOUNT_BUTTON_TEXT_COLOR,
+        }
+        for time_widget in (self.time_left_text, self.time_of_last_drop_text):
+            for clickable_part in (time_widget, self.text_slot_frames[time_widget], *time_widget.part_labels):
+                clickable_part.configure(cursor="hand2")
+                clickable_part.bind("<Button-1>", lambda event: self.switch_to_mini_clock())
+
         self.move_to_bottom_right_above_taskbar()
         self.keep_on_top_forever()
+
+    def note_moved_by_hand(self):
+        self.user_has_moved_label = True
+
+    def showing_window(self):
+        """The window of the current mode: the mini clock's, or the full label's."""
+        return self.mini_clock.window if self.is_minimized else self.tk_root
+
+    def switch_to_mini_clock(self):
+        self.switch_display_mode(minimized=True)
+
+    def switch_to_full_label(self):
+        self.switch_display_mode(minimized=False)
+
+    def switch_display_mode(self, minimized):
+        if minimized == self.is_minimized:
+            return
+        old_window = self.showing_window()
+        old_window.update_idletasks()
+        old_right = old_window.winfo_rootx() + old_window.winfo_width()
+        old_bottom = old_window.winfo_rooty() + old_window.winfo_height()
+        self.usage_history_graph.hide()
+        self.is_minimized = minimized
+        if minimized:
+            self.redraw_mini_clock()
+        new_window = self.showing_window()
+        if not self.is_hidden:
+            new_window.deiconify()
+            old_window.withdraw()
+        new_window.update_idletasks()
+        if self.user_has_moved_label:
+            # Keep the bottom-right corner where it was.
+            new_window.geometry(f"+{old_right - new_window.winfo_width()}+{old_bottom - new_window.winfo_height()}")
+        else:
+            self.move_to_bottom_right_above_taskbar()
+        if self.on_display_mode_changed:
+            self.on_display_mode_changed(minimized)
+
+    def redraw_mini_clock(self):
+        if self.is_minimized:
+            self.mini_clock.draw(**self.clock_inputs)
 
     def show_usage_history_graph(self, event=None):
         if not self.usage_history_graph.is_showing():
@@ -860,8 +1090,9 @@ class FloatingUsageLabel:
 
         Uses the real window and real screen positions from Windows rather than tkinter's geometry, because with two
         monitors at different scaling tkinter's placement sometimes landed on the second monitor."""
-        self.tk_root.update_idletasks()
-        window_handle = ctypes.windll.user32.GetAncestor(self.tk_root.winfo_id(), GA_ROOT)
+        showing_window = self.showing_window()
+        showing_window.update_idletasks()
+        window_handle = ctypes.windll.user32.GetAncestor(showing_window.winfo_id(), GA_ROOT)
         window_rect = ctypes.wintypes.RECT()
         ctypes.windll.user32.GetWindowRect(window_handle, ctypes.byref(window_rect))
         work_area = ctypes.wintypes.RECT()
@@ -926,6 +1157,10 @@ class FloatingUsageLabel:
             self.login_button.pack(side="left", padx=(8, 0))
         self.usage_left_bar.show_fraction(usage_left_fraction, usage_color)
         self.time_left_bar.show_fraction(time_left_fraction)
+        self.clock_inputs.update(
+            time_left_fraction=time_left_fraction, usage_left_fraction=usage_left_fraction, usage_color=usage_color
+        )
+        self.redraw_mini_clock()
         if not self.user_has_moved_label:
             # The text width changes, so keep the right edge pinned to the screen corner.
             self.move_to_bottom_right_above_taskbar()
@@ -976,26 +1211,37 @@ class FloatingUsageLabel:
         self.account_button_frame.configure(
             width=longest_name_pixels + 12, height=self.account_name_text.winfo_reqheight() + 2
         )
+        self.clock_inputs.update(
+            account_name=account_name,
+            account_name_color=ACCOUNT_BUTTON_TEXT_COLOR if is_logged_in else ACCOUNT_LOGGED_OUT_TEXT_COLOR,
+        )
+        self.redraw_mini_clock()
 
     def color_account_button(self, background_color):
         self.account_button_frame.configure(background=background_color)
         self.account_name_text.configure(background=background_color)
 
     def hide(self):
+        self.is_hidden = True
+        self.usage_history_graph.hide()
         self.tk_root.withdraw()
+        self.mini_clock.window.withdraw()
 
     def show_at_default_position(self):
-        self.tk_root.deiconify()
+        """From the tray icon: show the current mode (full label or mini clock) back in its corner."""
+        self.is_hidden = False
+        self.showing_window().deiconify()
         self.user_has_moved_label = False
         self.move_to_bottom_right_above_taskbar()
 
     def keep_on_top_forever(self):
         """Re-applied 4 times a second: Windows can push it down (a taskbar click puts the taskbar above it), and can
         move it (to the second monitor), so it is raised and, unless dragged by hand, put back in its corner."""
-        if self.tk_root.state() != "withdrawn":
-            self.tk_root.attributes("-topmost", False)
-            self.tk_root.attributes("-topmost", True)
-            self.tk_root.lift()
+        showing_window = self.showing_window()
+        if showing_window.state() != "withdrawn":
+            showing_window.attributes("-topmost", False)
+            showing_window.attributes("-topmost", True)
+            showing_window.lift()
             if not self.user_has_moved_label:
                 self.move_to_bottom_right_above_taskbar()
         self.tk_root.after(STAY_ON_TOP_CHECK_MILLISECONDS, self.keep_on_top_forever)
@@ -1034,7 +1280,11 @@ class UsageTrayApp:
             on_login_requested=self.open_claude_login_window,
             on_account_button_clicked=self.toggle_account_panel,
             read_graph_history_entries=self.read_selected_account_history,
+            on_display_mode_changed=self.save_display_mode,
         )
+        # Start in the mode it was left in (full label or mini clock).
+        if read_tray_settings().get("displayMode") == "mini":
+            self.floating_label.switch_to_mini_clock()
         self.account_panel = AccountPanel(
             self.tk_root,
             on_select_account=self.select_account_from_panel,
@@ -1063,6 +1313,12 @@ class UsageTrayApp:
             ),
         )
         self.account_changed_event.set()  # show the account name on the label once the loop starts
+
+    @staticmethod
+    def save_display_mode(minimized):
+        tray_settings = read_tray_settings()
+        tray_settings["displayMode"] = "mini" if minimized else "full"
+        save_tray_settings(tray_settings)
 
     def read_selected_account_history(self):
         return [

@@ -24,7 +24,7 @@ Remote: `https://github.com/ekkSoft/claude-usage-tray`. No tests or lint config.
 - 401 / missing token → `UsageLoginNeededError`: the label shows a `🔑 Log in` button (and the tray menu an item)
   that opens a console running `claude auth login` for the selected account; the user signs in themselves.
 - 429 → wait the server's `Retry-After`. Fetching every 60 s got it rate limited for 9+ hours: keep ≥ 5 min.
-- Label (tkinter, borderless, topmost, bottom-right above the taskbar, draggable, right-click → Hide / Quit), top to
+- Label (tkinter, borderless, topmost, bottom-right above the taskbar, dragged only by the "⠿" grip at the text row's left end, right-click → Hide / Quit), top to
   bottom: a weekly-limit-left bar in 7 day segments (Claude orange #d97757, the partly used day white); a 7-day segment bar for how much SHOULD be left (time until the weekly reset:
   whole days only, in gray: the day in progress and empty parts are not drawn; `SegmentBar`); the text row
   "⚡ 081% (03%)  ⏳ 03h43m (06m)  FIN"; a blue time-left bar and the usage-left bar, both in 5 segments (an hour / 20% each)
@@ -32,6 +32,12 @@ Remote: `https://github.com/ekkSoft/claude-usage-tray`. No tests or lint config.
   Numbers have a fixed length so the width never changes; each text sits in a fixed-size slot frame
   (`put_in_slot` / `set_slot_text`); leading zeros are drawn gray (`LeadingZerosGrayText`). No drop yet → gray
   "(00%)" / "(00s)" placeholders. Drop time is 2 digits + s/m/h.
+- Two display modes: the label above is "maximize"; clicking its time ("⏳ 02h11m (06m)") switches to "minimize",
+  a round mini clock (`MiniClock`, drawn by `draw_mini_clock_image` with PIL at 4x and shrunk; corners made
+  see-through with `-transparentcolor`; Claude orange outer ring, then a light gray rim, so it stands out on dark windows). Full circle = the 5-hour window: hour + 10-minute ticks, long blue needle =
+  time left, short needle (usage color) = usage left (full turn = 100%), the account name in the middle (red when
+  signed out). Drag it from anywhere; a click without dragging goes back.
+  Switching keeps the bottom-right corner; the mode is saved as `displayMode` ("full" / "mini") in the settings.
 - Each successful fetch also appends a line to `~/.claude/usage-history.jsonl` (`at`, `accountFolder`,
   `fiveHourPercentUsed`, `fiveHourResetsAt`; kept 24 h). Hovering over the "⚡ 081% (03%)" text or the usage-left bar
   pops up `UsageHistoryGraph` above the label: 5-hour usage left over the last 10 h (two windows), one column per
