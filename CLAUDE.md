@@ -47,6 +47,9 @@ Remote: `https://github.com/ekkSoft/claude-usage-tray`. No tests or lint config.
   token), "out" → "Log in" (console running `claude auth login`); all with that account's `CLAUDE_CONFIG_DIR`. An
   account not used in Claude Code for hours shows "expired": its token lasts ~8 h. Each row also shows
   the time left in that account's 5-hour window from its latest line in `usage-history.jsonl` ("1h 25m left" / "n/a", right-aligned).
+  Cross-check (`find_suspicious_account_pairs`): two accounts whose latest entries have the same 5-hour % and reset
+  time (within a minute), or the same email, get an orange "⚠ … the numbers may be wrong (same login in both?)"
+  alert under the rows: different accounts never match, so one was likely fetched with the other's login.
   The
   email comes from `.claude.json` (no token in it). Snapshots of another account (by `accountFolder`) are ignored.
 - Tray icon shows the 5-hour % (green < 70, orange ≥ 70, red ≥ 90). Notifications once per 5-hour window at 70%

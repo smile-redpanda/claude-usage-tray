@@ -78,6 +78,8 @@ ACCOUNT_BUTTON_HOVER_COLOR = "#4a4a4a"
 ACCOUNT_BUTTON_TEXT_COLOR = "#dddddd"
 ACCOUNT_LOGGED_OUT_TEXT_COLOR = "#ff6b6b"  # red: the account is signed out
 LOGIN_BUTTON_COLOR = "#3a6ea5"
+ALERT_TEXT_COLOR = "#ffb347"  # orange: a problem shown in the account panel
+ALERT_BACKGROUND_COLOR = "#3a2a14"
 FIVE_HOUR_WINDOW_MINUTES = 5 * 60
 STAY_ON_TOP_CHECK_MILLISECONDS = 250
 # Windows API constants for placing the label.
@@ -606,8 +608,8 @@ class AccountPanel:
     def hide(self):
         self.popup_window.withdraw()
 
-    def show_above(self, label_window, account_rows):
-        self.rebuild(account_rows)
+    def show_above(self, label_window, account_rows, alert_texts=()):
+        self.rebuild(account_rows, alert_texts)
         self.popup_window.update_idletasks()
         popup_left = label_window.winfo_rootx() + label_window.winfo_width() - self.popup_window.winfo_reqwidth()
         popup_top = label_window.winfo_rooty() - self.popup_window.winfo_reqheight() - 4
@@ -618,15 +620,16 @@ class AccountPanel:
         self.popup_window.lift()
         self.popup_window.focus_force()
 
-    def update_if_changed(self, account_rows):
+    def update_if_changed(self, account_rows, alert_texts=()):
         """Called every second while open, so a login or logout finishing in its console shows up by itself."""
-        if self.is_showing() and account_rows != self.shown_account_rows:
-            self.rebuild(account_rows)
+        if self.is_showing() and (account_rows, list(alert_texts)) != self.shown_account_rows:
+            self.rebuild(account_rows, alert_texts)
 
-    def rebuild(self, account_rows):
+    def rebuild(self, account_rows, alert_texts=()):
         """account_rows: [{"name", "email", "loginState" ("in" / "expired" / "out"), "isSelected",
-        "usageText", "usageColor"}]."""
-        self.shown_account_rows = account_rows
+        "usageText", "usageColor"}]; alert_texts: problems to show under the rows in orange, e.g. two accounts
+        showing the same usage."""
+        self.shown_account_rows = (account_rows, list(alert_texts))
         for old_widget in self.content_frame.winfo_children():
             old_widget.destroy()
         background = LABEL_BACKGROUND_COLOR
@@ -691,6 +694,13 @@ class AccountPanel:
             action_button.bind(
                 "<Button-1>", lambda event, account_name=account_row["name"], action=action: action(account_name)
             )
+
+        for alert_number, alert_text in enumerate(alert_texts):
+            tkinter.Label(
+                self.content_frame, text=f"⚠ {alert_text}\n    the numbers may be wrong (same login in both?)",
+                font=("Segoe UI", 8, "bold"), foreground=ALERT_TEXT_COLOR, background=ALERT_BACKGROUND_COLOR,
+                anchor="w", justify="left", padx=6, pady=2,
+            ).grid(row=len(account_rows) + 1 + alert_number, column=0, columnspan=5, sticky="we", pady=(4, 0))
 
 
 class FloatingUsageLabel:
@@ -1359,10 +1369,39 @@ class UsageTrayApp:
         hours, minutes = divmod(minutes_left, 60)
         return (f"{hours}h {minutes}m left" if hours else f"{minutes}m left"), TIME_LEFT_COLOR
 
-    def build_account_rows(self):
+    @staticmethod
+    def find_suspicious_account_pairs(accounts_with_latest_entries):
+        """Two different Claude accounts never have the same 5-hour % used AND the same reset time (to the minute), or
+        the same email: if they do, the app most likely fetched one account's numbers with the other one's login.
+        Returns alert texts, e.g. "FIN and DEV show the same usage and reset time"."""
+        alert_texts = []
+        for first_position, (first_account, first_entry, first_email) in enumerate(accounts_with_latest_entries):
+            for second_account, second_entry, second_email in accounts_with_latest_entries[first_position + 1:]:
+                both_names = f"{first_account['name'].upper()} and {second_account['name'].upper()}"
+                if first_email and first_email == second_email:
+                    alert_texts.append(f"{both_names} are signed in to the same email")
+                if first_entry is None or second_entry is None:
+                    continue
+                if first_entry.get("fiveHourPercentUsed") is None or not first_entry.get("fiveHourResetsAt"):
+                    continue
+                first_reset_utc = datetime.fromisoformat(first_entry["fiveHourResetsAt"].replace("Z", "+00:00"))
+                second_reset_text = second_entry.get("fiveHourResetsAt")
+                if not second_reset_text:
+                    continue
+                second_reset_utc = datetime.fromisoformat(second_reset_text.replace("Z", "+00:00"))
+                if (
+                    first_entry["fiveHourPercentUsed"] == second_entry.get("fiveHourPercentUsed")
+                    and abs((first_reset_utc - second_reset_utc).total_seconds()) < 60
+                ):
+                    alert_texts.append(f"{both_names} show the same usage and reset time")
+        return alert_texts
+
+    def build_account_panel_data(self):
+        """(account rows, alert texts) for the account panel."""
         now_utc = datetime.now(timezone.utc)
         all_history_entries = read_usage_history()
         account_rows = []
+        accounts_with_latest_entries = []
         for account in list_claude_accounts():
             latest_history_entry = next(
                 (
@@ -1372,15 +1411,17 @@ class UsageTrayApp:
                 None,
             )
             usage_text, usage_color = self.describe_five_hour_window(latest_history_entry, now_utc)
+            account_email = read_account_email(account["folder"])
+            accounts_with_latest_entries.append((account, latest_history_entry, account_email))
             account_rows.append({
                 "name": account["name"],
-                "email": read_account_email(account["folder"]),
+                "email": account_email,
                 "loginState": self.read_login_state(account),
                 "isSelected": account["name"] == self.selected_account["name"],
                 "usageText": usage_text,
                 "usageColor": usage_color,
             })
-        return account_rows
+        return account_rows, self.find_suspicious_account_pairs(accounts_with_latest_entries)
 
     def select_account_from_panel(self, account_name):
         self.select_account(self.find_account(account_name))
@@ -1390,7 +1431,7 @@ class UsageTrayApp:
         if self.account_panel.is_showing():
             self.account_panel.hide()
         else:
-            self.account_panel.show_above(self.tk_root, self.build_account_rows())
+            self.account_panel.show_above(self.tk_root, *self.build_account_panel_data())
 
     def update_account_button_and_panel(self):
         """Every second: the account button turns red / back when the selected account signs out / in, and the open
@@ -1404,7 +1445,7 @@ class UsageTrayApp:
             self.shown_account_button_state = button_state
             self.floating_label.show_account_name(self.selected_account["name"], account_names, button_state[2])
         if self.account_panel.is_showing():
-            self.account_panel.update_if_changed(self.build_account_rows())
+            self.account_panel.update_if_changed(*self.build_account_panel_data())
 
     def open_claude_login_window(self):
         self.open_claude_auth_window(self.selected_account, "login")
