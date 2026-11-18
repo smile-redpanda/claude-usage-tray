@@ -3,8 +3,10 @@
 Every 5 minutes it fetches your live usage from Anthropic (the same undocumented address Claude Code's /usage screen
 uses, signed in with your Claude Code login), saves it to USAGE_JSON_FILE_PATH, and shows:
   - a small floating label (always on top, drag it anywhere): "⚡ 053% (03%)  ⏳ 03h21m (06m)" (% of the 5-hour limit
-    left and its last drop, in the usage color; time in blue), the weekly limit as 7 circles, and the account name;
-    a blue time-left bar on top and a green / orange / red usage-left bar below
+    left and its last drop, in the usage color; time in blue), and the account name;
+    above the text the weekly limit left (Claude orange) and how much should be left by now (gray); below the text a blue
+    time-left bar, then a green / orange / red usage-left bar at the bottom; hovering over the usage shows a graph
+    of the 5-hour usage left over the last 10 hours (from USAGE_HISTORY_FILE_PATH, one line per fetch)
   - an icon with the 5-hour usage %, colored green / orange / red
   - hover text with time left, 5-hour %, weekly %, and when it was last updated
   - a Windows notification, once per 5-hour window, when usage crosses 70% and when 30 minutes are left
@@ -17,7 +19,6 @@ Run it from the repository root:
 import ctypes
 import ctypes.wintypes
 import json
-import math
 import os
 import re
 import subprocess
@@ -31,10 +32,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pystray
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageDraw, ImageFont
 
 USAGE_JSON_FILE_PATH = Path.home() / ".claude" / "usage-watch.json"
-SHOWN_WARNINGS_FILE_PATH = Path.home() / ".claude" / "usage-tray-shown-warnings.json"
+# One line per fetch, for the graph shown when hovering over the usage on the label.
+USAGE_HISTORY_FILE_PATH = Path.home() / ".claude" / "usage-history.jsonl"
+USAGE_HISTORY_KEEP_HOURS = 24
+HISTORY_GRAPH_HOURS = 10  # two 5-hour windows
+SHOWN_WARNINGS_FILE_PATH =Path.home() / ".claude" / "usage-tray-shown-warnings.json"
 PLACEMENT_LOG_FILE_PATH =Path.home() / ".claude" / "usage-tray-placement.log"
 # Claude Code's own settings folder; another account lives in its own folder (Claude Code's CLAUDE_CONFIG_DIR).
 DEFAULT_CLAUDE_CONFIG_FOLDER = Path.home() / ".claude"
@@ -53,25 +58,25 @@ WARN_WHEN_MINUTES_UNTIL_RESET_AT_OR_BELOW = 30
 HIGH_USAGE_WARNING_PERCENTAGE = 70
 ICON_SIZE_PIXELS = 64
 BAR_HEIGHT_PIXELS = 5
+EXPECTED_BAR_HEIGHT_PIXELS = 3  # the gray weekly "should be left" bar, thinner than the others
 TIME_LEFT_COLOR = "#5aaaff"  # blue: the time-left bar and the label text
 # A thin space between "⚡" / "⏳" and the number; a normal space looked too far apart.
 ICON_GAP = "\u2009"
 # Numbers on the label have a fixed length ("081%", "03h43m", "(06m)"), so its width never changes; the leading zeros
 # are drawn in this dim gray so "081%" still reads as 81%.
 LEADING_ZEROS_COLOR = "#5a5a5a"
-# The weekly limit as 7 circles, one per day's share.
+# The two weekly bars above the text, each split into 7 day segments.
 WEEKLY_PART_COUNT = 7
-WEEKLY_CIRCLE_GRID_SIZE = 3  # 3 rows x 3 columns
-WEEKLY_CIRCLE_DIAMETER_PIXELS = 7
-WEEKLY_CIRCLE_DRAWING_SCALE = 4  # drawn 4x bigger, then shrunk, for smooth edges
-WEEKLY_CIRCLE_GAP_PIXELS = 4  # room for the squares between circles
-WEEKLY_CIRCLE_SQUARE_MARGIN_PIXELS = 1.5  # how far the "should be left" square reaches past its circle
-WEEKLY_CIRCLE_SQUARE_COLOR = "#6a6a6a"  # light gray
-WEEKLY_CIRCLE_LEFT_COLOR = "#3dd6c6"  # teal
-WEEKLY_CIRCLE_IN_USE_COLOR = "#e8e8e8"  # white: the circle being used now, and its bar
-WEEKLY_IN_USE_BAR_OUTLINE_PIXELS = 2
-WEEKLY_IN_USE_BAR_TRACK_COLOR = "#4a4a4a"  # the empty part of the bar, visible on the dark background
-WEEKLY_CIRCLE_USED_UP_COLOR = "#333333"  # dark gray, so it stands out on the light gray "should be left" square
+WEEKLY_LEFT_FULL_DAY_COLOR = "#d97757"  # Claude orange: a whole day's share of the weekly limit still left
+WEEKLY_LEFT_PART_DAY_COLOR = "#ffffff"  # white: the day's share that is partly used
+WEEKLY_EXPECTED_LEFT_FULL_DAY_COLOR = "#8a8a8a"  # gray: a whole day that should be left, in the bar above the text
+LABEL_BACKGROUND_COLOR = "#222222"
+# The account button at the right end of the label, and the account panel it opens.
+ACCOUNT_BUTTON_COLOR = "#3a3a3a"
+ACCOUNT_BUTTON_HOVER_COLOR = "#4a4a4a"
+ACCOUNT_BUTTON_TEXT_COLOR = "#dddddd"
+ACCOUNT_LOGGED_OUT_TEXT_COLOR = "#ff6b6b"  # red: the account is signed out
+LOGIN_BUTTON_COLOR = "#3a6ea5"
 FIVE_HOUR_WINDOW_MINUTES = 5 * 60
 STAY_ON_TOP_CHECK_MILLISECONDS = 250
 # Windows API constants for placing the label.
@@ -203,6 +208,46 @@ def read_usage_snapshot():
         return json.loads(USAGE_JSON_FILE_PATH.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return None
+
+
+def read_usage_history():
+    """Every saved fetch (oldest first), as dicts; lines that can't be read are skipped."""
+    try:
+        history_lines = USAGE_HISTORY_FILE_PATH.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    history_entries = []
+    for history_line in history_lines:
+        try:
+            history_entry = json.loads(history_line)
+            history_entry["atTime"] = datetime.fromisoformat(history_entry["at"])
+            history_entries.append(history_entry)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            pass
+    return history_entries
+
+
+def append_usage_history(usage_snapshot):
+    """Add one line per fetch to USAGE_HISTORY_FILE_PATH (for the hover graph), dropping lines older than
+    USAGE_HISTORY_KEEP_HOURS so the file stays small (~300 lines a day per account)."""
+    five_hour = usage_snapshot.get("fiveHour") or {}
+    new_entry = {
+        "at": usage_snapshot["updatedAt"],
+        "accountFolder": usage_snapshot.get("accountFolder"),
+        "fiveHourPercentUsed": five_hour.get("percentUsed"),
+        "fiveHourResetsAt": five_hour.get("resetsAt"),
+    }
+    oldest_kept_time = datetime.now(timezone.utc) - timedelta(hours=USAGE_HISTORY_KEEP_HOURS)
+    kept_entries = [
+        {key: value for key, value in history_entry.items() if key != "atTime"}
+        for history_entry in read_usage_history()
+        if history_entry["atTime"] >= oldest_kept_time
+    ]
+    temporary_file_path = USAGE_HISTORY_FILE_PATH.with_suffix(".tmp")
+    temporary_file_path.write_text(
+        "".join(json.dumps(history_entry) + "\n" for history_entry in kept_entries + [new_entry]), encoding="utf-8"
+    )
+    temporary_file_path.replace(USAGE_HISTORY_FILE_PATH)
 
 
 def minutes_until(iso_time_text, now_utc):
@@ -345,7 +390,7 @@ def draw_icon_image(percent_used):
 class ThinBar:
     """A thin progress bar the width of the floating label: a filled part over a dark track."""
 
-    def __init__(self, tk_root, fill_color):
+    def __init__(self, tk_root, fill_color, gap_below_pixels=0):
         self.fill_color = fill_color
         self.filled_fraction = None
         self.canvas = tkinter.Canvas(
@@ -356,7 +401,7 @@ class ThinBar:
             highlightthickness=0,
             borderwidth=0,
         )
-        self.canvas.pack(fill="x")
+        self.canvas.pack(fill="x", pady=(0, gap_below_pixels))
         self.filled_part = self.canvas.create_rectangle(0, 0, 0, BAR_HEIGHT_PIXELS, fill=fill_color, width=0)
         self.canvas.bind("<Configure>", lambda event: self.redraw())
 
@@ -372,149 +417,343 @@ class ThinBar:
         self.canvas.itemconfigure(self.filled_part, fill=self.fill_color)
 
 
-class WeeklyDayCircles:
-    """7 small circles left of "⚡", in a 3 x 3 grid filled column by column (3 + 3 + 1): the weekly limit LEFT, split
-    into 7 equal parts (one per day, about 14.3% each). All teal at the start of the week; they empty from the last
-    one back as the week is used. The one in use now is white, and the grid's empty corner (bottom right, 2 slots tall)
-    shows how much of it is left as a white bar. Used-up parts are dark gray.
+class SevenDaySegmentBar:
+    """A thin bar split into 7 day segments (with 1 px gaps), filled from the left: whole days in the full color, the
+    partly gone day in the part color, filled as far as it has left (not drawn when part_day_color is None). With
+    show_empty_track=False the empty parts are
+    not drawn (just the label background)."""
 
-    A light gray square behind the circles marks those you SHOULD still have to last the week: one per day left until
-    the weekly reset (7 on the first day, 6 on the second, ...). Filled circles without a square are spare; squares
-    behind gray circles mean you are using it faster than one part a day."""
-
-    def __init__(self, parent_widget):
-        # The squares reach past the circles, so the grid keeps a margin for them.
-        self.grid_size_pixels = (
-            WEEKLY_CIRCLE_GRID_SIZE * WEEKLY_CIRCLE_DIAMETER_PIXELS
-            + (WEEKLY_CIRCLE_GRID_SIZE - 1) * WEEKLY_CIRCLE_GAP_PIXELS
-            + round(2 * WEEKLY_CIRCLE_SQUARE_MARGIN_PIXELS)
+    def __init__(
+        self, tk_root, full_day_color, part_day_color, gap_below_pixels=0, show_empty_track=True,
+        height_pixels=BAR_HEIGHT_PIXELS,
+    ):
+        self.show_empty_track = show_empty_track
+        self.full_day_color = full_day_color
+        self.part_day_color = part_day_color
+        self.height_pixels = height_pixels
+        self.filled_fraction = None
+        self.canvas = tkinter.Canvas(
+            tk_root,
+            width=1,  # let the text set the label's width; the bar stretches to match
+            height=height_pixels,
+            background=LABEL_BACKGROUND_COLOR,
+            highlightthickness=0,
+            borderwidth=0,
         )
-        # A picture drawn with Pillow rather than tkinter canvas shapes: tkinter draws without smoothing, which made
-        # circles this small look jagged and fuzzy.
-        self.circles_photo = None  # tkinter shows the picture only while Python keeps a reference to it
-        self.widget = tkinter.Label(parent_widget, background="#222222", borderwidth=0)
-        self.widget.pack(side="right", padx=(5, 0))
-        self.show_weekly_percent_used(None, None)
+        self.canvas.pack(fill="x", pady=(0, gap_below_pixels))
+        self.canvas.bind("<Configure>", lambda event: self.redraw())
 
-    @staticmethod
-    def grid_slot_top_left(column_number, row_number):
-        """Top-left corner, in real pixels, of a slot in the 3 x 3 grid."""
-        return (
-            WEEKLY_CIRCLE_SQUARE_MARGIN_PIXELS + column_number * (WEEKLY_CIRCLE_DIAMETER_PIXELS + WEEKLY_CIRCLE_GAP_PIXELS),
-            WEEKLY_CIRCLE_SQUARE_MARGIN_PIXELS + row_number * (WEEKLY_CIRCLE_DIAMETER_PIXELS + WEEKLY_CIRCLE_GAP_PIXELS),
-        )
+    def show_fraction(self, filled_fraction):
+        self.filled_fraction = filled_fraction
+        self.redraw()
 
-    def draw_circles_image(self, parts_left, parts_that_should_be_left):
-        """Draw at WEEKLY_CIRCLE_DRAWING_SCALE times the size, then shrink: the shrinking smooths the edges."""
-        scale = WEEKLY_CIRCLE_DRAWING_SCALE
-        big_image = Image.new("RGB", (self.grid_size_pixels * scale,) * 2, "#222222")
-        draw = ImageDraw.Draw(big_image)
-        fraction_of_part_in_use_left = None
-        for part_number in range(WEEKLY_PART_COUNT):
-            circle_left, circle_top = self.grid_slot_top_left(*divmod(part_number, WEEKLY_CIRCLE_GRID_SIZE))
-            circle_box = [
-                circle_left * scale,
-                circle_top * scale,
-                (circle_left + WEEKLY_CIRCLE_DIAMETER_PIXELS) * scale - 1,
-                (circle_top + WEEKLY_CIRCLE_DIAMETER_PIXELS) * scale - 1,
-            ]
-            # Behind the circles that should still be left: a light gray square.
-            if part_number < parts_that_should_be_left:
-                square_margin = WEEKLY_CIRCLE_SQUARE_MARGIN_PIXELS * scale
-                draw.rounded_rectangle(
-                    [
-                        circle_box[0] - square_margin,
-                        circle_box[1] - square_margin,
-                        circle_box[2] + square_margin,
-                        circle_box[3] + square_margin,
-                    ],
-                    radius=scale,
-                    fill=WEEKLY_CIRCLE_SQUARE_COLOR,
-                )
-            fraction_of_this_part_left = max(0.0, min(1.0, parts_left - part_number))
-            if fraction_of_this_part_left >= 1:
-                circle_color = WEEKLY_CIRCLE_LEFT_COLOR
-            elif fraction_of_this_part_left > 0:
-                circle_color = WEEKLY_CIRCLE_IN_USE_COLOR
-                fraction_of_part_in_use_left = fraction_of_this_part_left
+    def redraw(self):
+        self.canvas.delete("all")
+        width = self.canvas.winfo_width()
+        days_left = 0 if self.filled_fraction is None else max(0.0, min(1.0, self.filled_fraction)) * WEEKLY_PART_COUNT
+        for day_number in range(WEEKLY_PART_COUNT):
+            left = round(width * day_number / WEEKLY_PART_COUNT)
+            right = round(width * (day_number + 1) / WEEKLY_PART_COUNT) - (1 if day_number < WEEKLY_PART_COUNT - 1 else 0)
+            if self.show_empty_track:
+                self.canvas.create_rectangle(left, 0, right, self.height_pixels, fill="#3a3a3a", width=0)
+            fraction_of_day_left = max(0.0, min(1.0, days_left - day_number))
+            if fraction_of_day_left >= 1:
+                color = self.full_day_color
+            elif fraction_of_day_left > 0 and self.part_day_color is not None:
+                color = self.part_day_color
             else:
-                circle_color = WEEKLY_CIRCLE_USED_UP_COLOR
-            draw.ellipse(circle_box, fill=circle_color)
+                continue
+            filled_right = left + round((right - left) * fraction_of_day_left)
+            self.canvas.create_rectangle(left, 0, filled_right, self.height_pixels, fill=color, width=0)
 
-        # The empty corner (column 3, rows 2-3): a white bar, full from the bottom, for how much of the white circle
-        # is left.
-        if fraction_of_part_in_use_left is not None:
-            # As wide as a gray square and as tall as two, so it fills the corner.
-            square_margin = WEEKLY_CIRCLE_SQUARE_MARGIN_PIXELS
-            bar_left, bar_top = self.grid_slot_top_left(2, 1)
-            bar_bottom = self.grid_slot_top_left(2, 2)[1] + WEEKLY_CIRCLE_DIAMETER_PIXELS
-            bar_box = [
-                (bar_left - square_margin) * scale,
-                (bar_top - square_margin) * scale,
-                (bar_left + WEEKLY_CIRCLE_DIAMETER_PIXELS + square_margin) * scale - 1,
-                (bar_bottom + square_margin) * scale - 1,
+
+class UsageHistoryGraph:
+    """A popup above the label, like a phone's battery graph: the 5-hour usage LEFT over the last HISTORY_GRAPH_HOURS,
+    one column per fetch (colored like the usage bar), with dashed blue lines where a 5-hour window reset."""
+
+    def __init__(self, tk_root):
+        self.tk_root = tk_root
+        self.popup_window = tkinter.Toplevel(tk_root)
+        self.popup_window.withdraw()
+        self.popup_window.overrideredirect(True)
+        self.popup_window.attributes("-topmost", True)
+        # Sizes are for 100% Windows scaling; the app is DPI aware, so grow them with the screen's scaling.
+        self.scale = tk_root.winfo_fpixels("1i") / 96
+        self.width = round(380 * self.scale)
+        self.height = round(150 * self.scale)
+        self.canvas = tkinter.Canvas(
+            self.popup_window,
+            width=self.width,
+            height=self.height,
+            background=LABEL_BACKGROUND_COLOR,
+            highlightthickness=1,
+            highlightbackground="#444444",
+        )
+        self.canvas.pack()
+
+    def show_above(self, label_window, history_entries):
+        self.draw(history_entries, datetime.now(timezone.utc))
+        self.popup_window.update_idletasks()
+        popup_width = self.popup_window.winfo_reqwidth()
+        popup_height = self.popup_window.winfo_reqheight()
+        popup_left = label_window.winfo_rootx() + label_window.winfo_width() - popup_width
+        popup_top = label_window.winfo_rooty() - popup_height - 4
+        if popup_top < 0:  # the label was dragged to the top of the screen: show it below instead
+            popup_top = label_window.winfo_rooty() + label_window.winfo_height() + 4
+        self.popup_window.geometry(f"+{max(0, popup_left)}+{popup_top}")
+        self.popup_window.deiconify()
+        self.popup_window.lift()
+
+    def hide(self):
+        self.popup_window.withdraw()
+
+    def is_showing(self):
+        return self.popup_window.state() != "withdrawn"
+
+    def draw(self, history_entries, now_utc):
+        scale = self.scale
+        canvas = self.canvas
+        canvas.delete("all")
+        small_font = ("Segoe UI", 8)
+        dim_text_color = "#999999"
+        plot_left = round(8 * scale)
+        plot_right = self.width - round(36 * scale)
+        plot_top = round(22 * scale)
+        plot_bottom = self.height - round(20 * scale)
+        graph_start_utc = now_utc - timedelta(hours=HISTORY_GRAPH_HOURS)
+        graph_seconds = HISTORY_GRAPH_HOURS * 3600
+
+        def x_for_time(time_utc):
+            seconds_from_start = (time_utc - graph_start_utc).total_seconds()
+            return plot_left + (plot_right - plot_left) * max(0.0, min(1.0, seconds_from_start / graph_seconds))
+
+        def y_for_percent_left(percent_left):
+            return plot_bottom - (plot_bottom - plot_top) * max(0.0, min(100.0, percent_left)) / 100
+
+        canvas.create_text(
+            plot_left, round(11 * scale), text=f"5-hour usage left · last {HISTORY_GRAPH_HOURS} h", anchor="w",
+            font=("Segoe UI", 8, "bold"), fill="#bbbbbb",
+        )
+        # Every 2 hours (on the local hour): a faint line and the hour below it, like "15  17  19".
+        local_now = datetime.now()
+        first_tick_local = (local_now - timedelta(hours=HISTORY_GRAPH_HOURS)).replace(
+            minute=0, second=0, microsecond=0
+        ) + timedelta(hours=1)
+        tick_local = first_tick_local
+        while tick_local <= local_now:
+            if tick_local.hour % 2 == 0:
+                tick_x = x_for_time(tick_local.astimezone(timezone.utc))
+                canvas.create_line(tick_x, plot_top, tick_x, plot_bottom, fill="#303030")
+                canvas.create_text(
+                    tick_x, plot_bottom + round(10 * scale), text=f"{tick_local.hour:02d}", font=small_font,
+                    fill=dim_text_color,
+                )
+            tick_local += timedelta(hours=1)
+        # 100% / 50% / 0% lines with their numbers on the right.
+        for percent_left in (100, 50, 0):
+            line_y = y_for_percent_left(percent_left)
+            canvas.create_line(plot_left, line_y, plot_right, line_y, fill="#3a3a3a", dash=(2, 3) if percent_left == 50 else None)
+            canvas.create_text(
+                plot_right + round(4 * scale), line_y, text=f"{percent_left}%", anchor="w", font=small_font,
+                fill=dim_text_color,
+            )
+
+        graph_entries = [
+            history_entry for history_entry in history_entries
+            if history_entry["atTime"] >= graph_start_utc - timedelta(minutes=10)
+        ]
+        # One column per fetch, from its time to the next fetch (at most 10 minutes: a longer gap means the app or
+        # computer was off, and stays empty).
+        for entry_number, history_entry in enumerate(graph_entries):
+            percent_used = history_entry.get("fiveHourPercentUsed")
+            if percent_used is None:
+                continue
+            column_start = history_entry["atTime"]
+            column_end = min(column_start + timedelta(minutes=10), now_utc)
+            if entry_number + 1 < len(graph_entries):
+                column_end = min(column_end, graph_entries[entry_number + 1]["atTime"])
+            column_left = x_for_time(column_start)
+            column_right = max(column_left + 1, x_for_time(column_end))
+            canvas.create_rectangle(
+                column_left, y_for_percent_left(100 - percent_used), column_right, plot_bottom,
+                fill=pick_usage_bar_color_for_percent(percent_used), width=0,
+            )
+        # Where each 5-hour window ended (its reset time), so the two windows can be told apart.
+        reset_times_utc = set()
+        for history_entry in graph_entries:
+            if history_entry.get("fiveHourResetsAt"):
+                reset_time_utc = datetime.fromisoformat(history_entry["fiveHourResetsAt"].replace("Z", "+00:00"))
+                reset_times_utc.add((reset_time_utc + timedelta(seconds=30)).replace(second=0, microsecond=0))
+        for reset_time_utc in reset_times_utc:
+            if graph_start_utc <= reset_time_utc <= now_utc:
+                reset_x = x_for_time(reset_time_utc)
+                canvas.create_line(reset_x, plot_top, reset_x, plot_bottom, fill=TIME_LEFT_COLOR, dash=(3, 2))
+
+        if not any(history_entry.get("fiveHourPercentUsed") is not None for history_entry in graph_entries):
+            canvas.create_text(
+                (plot_left + plot_right) / 2, (plot_top + plot_bottom) / 2,
+                text="No history yet: a point is added every 5 minutes.", font=small_font, fill=dim_text_color,
+            )
+
+
+class AccountPanel:
+    """The popup the account button opens, above the label: one row per account ("● FIN  fin@…  [Log out]"), click a
+    row to select it; "Log in" / "Log out" per account; × or Esc closes it."""
+
+    def __init__(self, tk_root, on_select_account, on_login, on_logout, on_renew):
+        self.tk_root = tk_root
+        self.on_renew = on_renew
+        self.on_select_account = on_select_account
+        self.on_login = on_login
+        self.on_logout = on_logout
+        self.shown_account_rows = None
+        self.popup_window = tkinter.Toplevel(tk_root)
+        self.popup_window.withdraw()
+        self.popup_window.overrideredirect(True)
+        self.popup_window.attributes("-topmost", True)
+        self.popup_window.configure(background="#444444")  # shows as a 1 px border around the content
+        self.popup_window.bind("<Escape>", lambda event: self.hide())
+        self.content_frame = tkinter.Frame(self.popup_window, background=LABEL_BACKGROUND_COLOR, padx=8, pady=6)
+        self.content_frame.pack(padx=1, pady=1)
+
+    def is_showing(self):
+        return self.popup_window.state() != "withdrawn"
+
+    def hide(self):
+        self.popup_window.withdraw()
+
+    def show_above(self, label_window, account_rows):
+        self.rebuild(account_rows)
+        self.popup_window.update_idletasks()
+        popup_left = label_window.winfo_rootx() + label_window.winfo_width() - self.popup_window.winfo_reqwidth()
+        popup_top = label_window.winfo_rooty() - self.popup_window.winfo_reqheight() - 4
+        if popup_top < 0:
+            popup_top = label_window.winfo_rooty() + label_window.winfo_height() + 4
+        self.popup_window.geometry(f"+{max(0, popup_left)}+{popup_top}")
+        self.popup_window.deiconify()
+        self.popup_window.lift()
+        self.popup_window.focus_force()
+
+    def update_if_changed(self, account_rows):
+        """Called every second while open, so a login or logout finishing in its console shows up by itself."""
+        if self.is_showing() and account_rows != self.shown_account_rows:
+            self.rebuild(account_rows)
+
+    def rebuild(self, account_rows):
+        """account_rows: [{"name", "email", "loginState" ("in" / "expired" / "out"), "isSelected",
+        "usageText", "usageColor"}]."""
+        self.shown_account_rows = account_rows
+        for old_widget in self.content_frame.winfo_children():
+            old_widget.destroy()
+        background = LABEL_BACKGROUND_COLOR
+        header_row = tkinter.Frame(self.content_frame, background=background)
+        header_row.grid(row=0, column=0, columnspan=5, sticky="we", pady=(0, 4))
+        tkinter.Label(
+            header_row, text="Accounts", font=("Segoe UI", 9, "bold"), foreground="#bbbbbb", background=background
+        ).pack(side="left")
+        close_button = tkinter.Label(
+            header_row, text="×", font=("Segoe UI", 10, "bold"), foreground="#999999", background=background,
+            cursor="hand2",
+        )
+        close_button.pack(side="right")
+        close_button.bind("<Button-1>", lambda event: self.hide())
+
+        for row_number, account_row in enumerate(account_rows, start=1):
+            row_background = "#2e2e2e" if account_row["isSelected"] else background
+            is_logged_in = account_row["loginState"] == "in"
+            name_color = ACCOUNT_BUTTON_TEXT_COLOR if is_logged_in else ACCOUNT_LOGGED_OUT_TEXT_COLOR
+            row_cells = [
+                tkinter.Label(
+                    self.content_frame, text="●" if account_row["isSelected"] else "○", font=("Segoe UI", 9),
+                    foreground=TIME_LEFT_COLOR if account_row["isSelected"] else "#777777", background=row_background,
+                    padx=4,
+                ),
+                tkinter.Label(
+                    self.content_frame, text=account_row["name"].upper(), font=("Segoe UI", 9, "bold"),
+                    foreground=name_color, background=row_background, anchor="w", padx=4,
+                ),
+                tkinter.Label(
+                    self.content_frame,
+                    text={"in": account_row["email"] or "?", "expired": "login expired"}.get(
+                        account_row["loginState"], "signed out"
+                    ),
+                    font=("Segoe UI", 8), foreground="#999999" if is_logged_in else name_color,
+                    background=row_background, anchor="w", padx=4,
+                ),
+                # Time left in its 5-hour window: "1h 25m left", or "n/a", right-aligned.
+                tkinter.Label(
+                    self.content_frame, text=account_row["usageText"], font=("Segoe UI", 8),
+                    foreground=account_row["usageColor"], background=row_background, anchor="e", padx=6,
+                ),
             ]
-            # A white outline shows the bar's full height, like a battery.
-            draw.rounded_rectangle(
-                bar_box,
-                radius=scale,
-                fill=WEEKLY_IN_USE_BAR_TRACK_COLOR,
-                outline=WEEKLY_CIRCLE_IN_USE_COLOR,
-                width=WEEKLY_IN_USE_BAR_OUTLINE_PIXELS * scale,
+            for column_number, row_cell in enumerate(row_cells):
+                row_cell.grid(row=row_number, column=column_number, sticky="nswe", pady=1)
+                row_cell.configure(cursor="hand2")
+                row_cell.bind(
+                    "<Button-1>", lambda event, account_name=account_row["name"]: self.on_select_account(account_name)
+                )
+            if is_logged_in:
+                action_text, action_color, action = "Log out", ACCOUNT_BUTTON_COLOR, self.on_logout
+            elif account_row["loginState"] == "expired":
+                # Only the short-lived token ran out: Claude Code renews it from the saved login, no browser needed.
+                action_text, action_color, action = "Renew", LOGIN_BUTTON_COLOR, self.on_renew
+            else:
+                action_text, action_color, action = "Log in", LOGIN_BUTTON_COLOR, self.on_login
+            action_button = tkinter.Label(
+                self.content_frame, text=action_text, font=("Segoe UI", 8, "bold"), foreground="white",
+                background=action_color, padx=8, cursor="hand2", width=7,
             )
-            filled_top = bar_box[3] - (bar_box[3] - bar_box[1]) * fraction_of_part_in_use_left
-            draw.rounded_rectangle(
-                [bar_box[0], filled_top, bar_box[2], bar_box[3]], radius=scale, fill=WEEKLY_CIRCLE_IN_USE_COLOR
+            action_button.grid(row=row_number, column=4, sticky="e", padx=(8, 0), pady=1)
+            action_button.bind(
+                "<Button-1>", lambda event, account_name=account_row["name"], action=action: action(account_name)
             )
-        return big_image.resize((self.grid_size_pixels,) * 2, Image.LANCZOS)
-
-    def show_weekly_percent_used(self, weekly_percent_used, minutes_left_in_week):
-        """None (unknown) shows all gray, or no squares."""
-        if minutes_left_in_week is None:
-            parts_that_should_be_left = 0
-        else:
-            # Days left, rounded up: on the first day (6 days and some hours to go) that is 7.
-            parts_that_should_be_left = min(WEEKLY_PART_COUNT, math.ceil(minutes_left_in_week / (24 * 60)))
-        if weekly_percent_used is None:
-            parts_left = 0
-        else:
-            # Counted in parts (e.g. 37% used = 4.41 parts left) rather than in % per part, which is 14.2857… and
-            # leaves rounding errors at 0% and 100%.
-            parts_left = (100 - weekly_percent_used) * WEEKLY_PART_COUNT / 100
-        self.circles_photo = ImageTk.PhotoImage(self.draw_circles_image(parts_left, parts_that_should_be_left))
-        self.widget.configure(image=self.circles_photo)
 
 
 class FloatingUsageLabel:
     """A small borderless always-on-top text window. Drag it with the left mouse button; right-click for a menu."""
 
-    def __init__(self, tk_root, on_quit_requested, on_login_requested, on_switch_account_requested):
+    def __init__(
+        self, tk_root, on_quit_requested, on_login_requested, on_account_button_clicked, read_graph_history_entries
+    ):
         self.tk_root = tk_root
+        self.read_graph_history_entries = read_graph_history_entries
         tk_root.overrideredirect(True)  # no title bar or border
         tk_root.attributes("-topmost", True)
         tk_root.attributes("-alpha", 0.9)
         tk_root.configure(background="#222222")
-        # Top bar (blue): time left in the 5-hour window, full at 5h left and empty at 0.
-        self.time_left_bar = ThinBar(tk_root, TIME_LEFT_COLOR)
+        # Above the text, two weekly bars in 7 day segments: first (at the very top) the weekly limit left (Claude orange, the
+        # partly used day white), then how much SHOULD be left by now, i.e. the time left until the weekly reset
+        # (whole days only, in gray; the day in progress and empty parts are not drawn).
+        self.weekly_usage_left_bar = SevenDaySegmentBar(
+            tk_root, WEEKLY_LEFT_FULL_DAY_COLOR, WEEKLY_LEFT_PART_DAY_COLOR, gap_below_pixels=1
+        )
+        self.weekly_expected_left_bar = SevenDaySegmentBar(
+            tk_root, WEEKLY_EXPECTED_LEFT_FULL_DAY_COLOR, part_day_color=None, show_empty_track=False,
+            height_pixels=EXPECTED_BAR_HEIGHT_PIXELS,
+        )
 
         # The text row: "⚡ 47%" in the usage bar's color first, then "⏳ 2h41m" in blue (matching the time bar).
         text_row = tkinter.Frame(tk_root, background="#222222", padx=6, pady=4)
         text_row.pack()
-        # At the right end, packed from the right before anything else: the account name at the very edge, then the
-        # weekly limit as 7 circles in a 3 x 3 grid just left of it.
-        # Which account this is, e.g. "dev"; shown only when there is more than one account. Click it to
-        # switch to the next account (so it is not a drag handle).
+        # At the right end, packed from the right before anything else: a button with the selected account's name, e.g.
+        # "DEV" (red when that account is signed out). Clicking it opens the account panel (so it is not a drag
+        # handle). It sits in a fixed-size frame as wide as the longest account name, so switching keeps the width.
+        self.account_button_frame = tkinter.Frame(text_row, background=ACCOUNT_BUTTON_COLOR, cursor="hand2")
+        self.account_button_frame.pack_propagate(False)
+        self.account_button_frame.pack(side="right", padx=(4, 0))
         self.account_name_text = tkinter.Label(
-            text_row,
+            self.account_button_frame,
             text="",
             font=("Segoe UI", 8, "bold"),
-            foreground="#999999",
-            background="#222222",
+            foreground=ACCOUNT_BUTTON_TEXT_COLOR,
+            background=ACCOUNT_BUTTON_COLOR,
             cursor="hand2",
         )
-        self.account_name_text.pack(side="right", padx=(4, 0))
-        self.account_name_text.bind("<Button-1>", lambda event: on_switch_account_requested())
-        self.weekly_day_circles = WeeklyDayCircles(text_row)
+        self.account_name_text.pack(expand=True)
+        for account_button_part in (self.account_button_frame, self.account_name_text):
+            account_button_part.bind("<Button-1>", lambda event: on_account_button_clicked())
+            account_button_part.bind("<Enter>", lambda event: self.color_account_button(ACCOUNT_BUTTON_HOVER_COLOR))
+            account_button_part.bind("<Leave>", lambda event: self.color_account_button(ACCOUNT_BUTTON_COLOR))
         label_font = ("Segoe UI", 10, "bold")
         self.usage_percent_text = LeadingZerosGrayText(
             text_row, text="", font=label_font, foreground="#bbbbbb", background="#222222"
@@ -555,7 +794,9 @@ class FloatingUsageLabel:
         )
         self.login_button.bind("<Button-1>", lambda event: on_login_requested())
 
-        # Bottom bar: usage left, full when nothing is used and empty at 100%; green / orange / red by usage.
+        # Below the text, two bars: first time left (blue) in the 5-hour window, full at 5h left and empty at 0.
+        self.time_left_bar = ThinBar(tk_root, TIME_LEFT_COLOR, gap_below_pixels=1)
+        # Then usage left at the very bottom, full when nothing is used and empty at 100%; green / orange / red by usage.
         self.usage_left_bar = ThinBar(tk_root, "#bbbbbb")
 
         self.drag_start_offset = (0, 0)
@@ -567,7 +808,6 @@ class FloatingUsageLabel:
             "<Button-3>", lambda event: right_click_menu.tk_popup(event.x_root, event.y_root)
         )
         for draggable_widget in (
-            self.weekly_day_circles.widget,
             text_row,
             self.time_left_text,
             self.time_of_last_drop_text,
@@ -581,8 +821,44 @@ class FloatingUsageLabel:
                 "<Button-3>", lambda event: right_click_menu.tk_popup(event.x_root, event.y_root)
             )
 
+        # Hovering over the usage (the "⚡ 081% (03%)" text or the usage bar) shows the last 10 hours as a graph.
+        self.usage_history_graph = UsageHistoryGraph(tk_root)
+        self.graph_hover_widgets = set()
+        for hover_widget in (
+            self.usage_percent_text,
+            self.usage_last_drop_text,
+            self.text_slot_frames[self.usage_percent_text],
+            self.text_slot_frames[self.usage_last_drop_text],
+            self.usage_left_bar.canvas,
+        ):
+            hover_widget.bind("<Enter>", self.show_usage_history_graph, add="+")
+            hover_widget.bind("<Leave>", lambda event: self.tk_root.after(150, self.hide_graph_if_pointer_left), add="+")
+            self.graph_hover_widgets.add(hover_widget)
+            self.graph_hover_widgets.update(getattr(hover_widget, "part_labels", []))
+
         self.move_to_bottom_right_above_taskbar()
         self.keep_on_top_forever()
+
+    def show_usage_history_graph(self, event=None):
+        if not self.usage_history_graph.is_showing():
+            self.usage_history_graph.show_above(self.tk_root, self.read_graph_history_entries())
+            self.tk_root.after(200, self.keep_graph_while_pointer_stays)
+
+    def keep_graph_while_pointer_stays(self):
+        """Tk doesn't always get a Leave event (e.g. when the pointer jumps away), so also check 5 times a second."""
+        if self.usage_history_graph.is_showing():
+            self.hide_graph_if_pointer_left()
+            self.tk_root.after(200, self.keep_graph_while_pointer_stays)
+
+    def hide_graph_if_pointer_left(self):
+        """Moving between the parts of the usage text fires Leave then Enter, so only hide once the pointer is really
+        off all of them."""
+        try:
+            pointer_widget = self.tk_root.winfo_containing(*self.tk_root.winfo_pointerxy())
+        except (KeyError, tkinter.TclError):  # over a menu or other window Tk can't name
+            pointer_widget = None
+        if pointer_widget not in self.graph_hover_widgets:
+            self.usage_history_graph.hide()
 
     def move_to_bottom_right_above_taskbar(self):
         """Place it at the bottom-right of the main monitor's work area (the screen minus the taskbar).
@@ -634,7 +910,10 @@ class FloatingUsageLabel:
         minutes_left_in_week=None,
     ):
         """Fractions are 0..1; None (unknown) draws an empty track rather than a guess."""
-        self.weekly_day_circles.show_weekly_percent_used(weekly_percent_used, minutes_left_in_week)
+        self.weekly_usage_left_bar.show_fraction(None if weekly_percent_used is None else 1 - weekly_percent_used / 100)
+        self.weekly_expected_left_bar.show_fraction(
+            None if minutes_left_in_week is None else minutes_left_in_week / (7 * 24 * 60)
+        )
         self.set_slot_text(self.time_left_text, time_text)
         self.set_slot_text(self.usage_percent_text, usage_percent_text, foreground=usage_color)
         # No drop yet (but numbers showing): all-gray "(00%)" / "(00s)" placeholders, so the spots are never blank.
@@ -688,18 +967,24 @@ class FloatingUsageLabel:
             width=max(slot_width, text_label.winfo_reqwidth()), height=slot_height
         )
 
-    def show_account_name(self, account_name, all_account_names):
-        """An empty name hides it (and its gap). Its slot fits the longest account name, so switching accounts doesn't
-        change the label's width ("fin" and "dev" are not equally wide)."""
+    def show_account_name(self, account_name, all_account_names, is_logged_in):
+        """The account button: the name in light gray, or red when that account is signed out. Its frame fits the
+        longest account name, so switching accounts doesn't change the label's width ("fin" and "dev" are not
+        equally wide)."""
         name_font_measurer = tkinter.font.Font(font=self.account_name_text.cget("font"))
-        account_name = account_name.upper()  # "FIN" / "DEV"
-        longest_name = max((name.upper() for name in all_account_names), key=name_font_measurer.measure)
-        self.account_name_text.configure(text=longest_name)
+        longest_name_pixels = max(name_font_measurer.measure(name.upper()) for name in all_account_names)
+        self.account_name_text.configure(
+            text=account_name.upper(),  # "FIN" / "DEV"
+            foreground=ACCOUNT_BUTTON_TEXT_COLOR if is_logged_in else ACCOUNT_LOGGED_OUT_TEXT_COLOR,
+        )
         self.account_name_text.update_idletasks()
-        # The label's own width counts characters, so size its text in pixels with padding instead.
-        extra_pixels = self.account_name_text.winfo_reqwidth() - name_font_measurer.measure(account_name or "")
-        self.account_name_text.configure(text=account_name, width=0)
-        self.account_name_text.pack_configure(padx=(4 + extra_pixels, 0) if account_name else 0)
+        self.account_button_frame.configure(
+            width=longest_name_pixels + 12, height=self.account_name_text.winfo_reqheight() + 2
+        )
+
+    def color_account_button(self, background_color):
+        self.account_button_frame.configure(background=background_color)
+        self.account_name_text.configure(background=background_color)
 
     def hide(self):
         self.tk_root.withdraw()
@@ -752,8 +1037,17 @@ class UsageTrayApp:
             self.tk_root,
             on_quit_requested=self.quit,
             on_login_requested=self.open_claude_login_window,
-            on_switch_account_requested=self.switch_to_next_account,
+            on_account_button_clicked=self.toggle_account_panel,
+            read_graph_history_entries=self.read_selected_account_history,
         )
+        self.account_panel = AccountPanel(
+            self.tk_root,
+            on_select_account=self.select_account_from_panel,
+            on_login=lambda account_name: self.open_claude_auth_window(self.find_account(account_name), "login"),
+            on_logout=lambda account_name: self.open_claude_auth_window(self.find_account(account_name), "logout"),
+            on_renew=lambda account_name: self.renew_login(self.find_account(account_name)),
+        )
+        self.shown_account_button_state = None
         self.tray_icon = pystray.Icon(
             "claude-usage",
             icon=draw_icon_image(None),
@@ -774,6 +1068,13 @@ class UsageTrayApp:
             ),
         )
         self.account_changed_event.set()  # show the account name on the label once the loop starts
+
+    def read_selected_account_history(self):
+        return [
+            history_entry for history_entry in read_usage_history()
+            if Path(history_entry.get("accountFolder") or DEFAULT_CLAUDE_CONFIG_FOLDER)
+            == Path(self.selected_account["folder"])
+        ]
 
     @staticmethod
     def find_account(account_name):
@@ -809,14 +1110,6 @@ class UsageTrayApp:
         self.account_changed_event.set()
         self.fetch_now_event.set()
 
-    def switch_to_next_account(self):
-        """Clicking the account name on the label: go to the next account (with two, that toggles between them)."""
-        all_accounts = list_claude_accounts()
-        account_names = [account["name"] for account in all_accounts]
-        current_position = account_names.index(self.selected_account["name"]) if (
-            self.selected_account["name"] in account_names
-        ) else -1
-        self.select_account(all_accounts[(current_position + 1) % len(all_accounts)])
 
     def add_account(self):
         """Runs on the tkinter loop: ask for a short name, make a separate Claude settings folder for it, select it,
@@ -947,7 +1240,7 @@ class UsageTrayApp:
             usage_left_fraction=usage_left_fraction,
             time_left_fraction=time_left_fraction,
             show_login_button=self.login_is_needed,
-            # After the weekly reset nothing of the new week is used yet: all circles full.
+            # After the weekly reset nothing of the new week is used yet: a full bar.
             weekly_percent_used=0 if weekly_window_has_reset else weekly.get("percentUsed"),
             # After the reset a whole new week is ahead, until the next fetch brings its real reset time.
             minutes_left_in_week=7 * 24 * 60 if weekly_window_has_reset else minutes_left_in_weekly_window,
@@ -1024,21 +1317,131 @@ class UsageTrayApp:
             pass  # not being able to remember is no reason to skip the notification
         self.tray_icon.notify(message, "Claude usage")
 
+    def read_login_state(self, account):
+        """"in": a login token that hasn't expired yet; "expired": the token (which lasts hours) ran out, or the
+        server turned it down, but the saved login can still renew it; "out": signed out. Only the expiry times are
+        read: the tokens themselves are never read out or shown."""
+        try:
+            claude_login = json.loads((Path(account["folder"]) / ".credentials.json").read_text(encoding="utf-8"))[
+                "claudeAiOauth"
+            ]
+        except (FileNotFoundError, KeyError, TypeError, json.JSONDecodeError):
+            return "out"
+        now_milliseconds = datetime.now(timezone.utc).timestamp() * 1000
+        can_renew = bool(claude_login.get("refreshToken")) and (
+            claude_login.get("refreshTokenExpiresAt") or float("inf")
+        ) > now_milliseconds
+        token_is_valid = bool(claude_login.get("accessToken")) and (
+            claude_login.get("expiresAt") or float("inf")
+        ) > now_milliseconds
+        if account["name"] == self.selected_account["name"] and self.login_is_needed:
+            token_is_valid = False  # the server said "login expired"
+        if token_is_valid:
+            return "in"
+        return "expired" if can_renew else "out"
+
+    def renew_login(self, account):
+        """Run "claude auth status" for that account, hidden: Claude Code then renews the expired token from the
+        saved login (it writes the new one to the credentials file itself). Then fetch again."""
+        renew_environment = dict(os.environ)
+        renew_environment.pop("CLAUDE_CONFIG_DIR", None)
+        if Path(account["folder"]) != DEFAULT_CLAUDE_CONFIG_FOLDER:
+            renew_environment["CLAUDE_CONFIG_DIR"] = account["folder"]
+
+        def renew_then_fetch():
+            try:
+                subprocess.run(
+                    ["cmd.exe", "/c", "claude auth status"], env=renew_environment, capture_output=True,
+                    timeout=60, creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            if account["name"] == self.selected_account["name"]:
+                self.login_is_needed = False
+                self.fetch_now_event.set()
+
+        threading.Thread(target=renew_then_fetch, daemon=True).start()
+
+    @staticmethod
+    def describe_five_hour_window(latest_history_entry, now_utc):
+        """(text, color) for an account's row in the panel, from its last saved fetch: the time left in its 5-hour
+        window, "8m left" / "1h 25m left" (right-aligned), or "n/a" when there's no window running (none fetched yet, or it reset)."""
+        minutes_left = None
+        if latest_history_entry is not None:
+            minutes_left = minutes_until(latest_history_entry.get("fiveHourResetsAt"), now_utc)
+        if not minutes_left:
+            return "n/a", "#777777"
+        hours, minutes = divmod(minutes_left, 60)
+        return (f"{hours}h {minutes}m left" if hours else f"{minutes}m left"), TIME_LEFT_COLOR
+
+    def build_account_rows(self):
+        now_utc = datetime.now(timezone.utc)
+        all_history_entries = read_usage_history()
+        account_rows = []
+        for account in list_claude_accounts():
+            latest_history_entry = next(
+                (
+                    history_entry for history_entry in reversed(all_history_entries)
+                    if Path(history_entry.get("accountFolder") or DEFAULT_CLAUDE_CONFIG_FOLDER) == Path(account["folder"])
+                ),
+                None,
+            )
+            usage_text, usage_color = self.describe_five_hour_window(latest_history_entry, now_utc)
+            account_rows.append({
+                "name": account["name"],
+                "email": read_account_email(account["folder"]),
+                "loginState": self.read_login_state(account),
+                "isSelected": account["name"] == self.selected_account["name"],
+                "usageText": usage_text,
+                "usageColor": usage_color,
+            })
+        return account_rows
+
+    def select_account_from_panel(self, account_name):
+        self.select_account(self.find_account(account_name))
+        self.account_panel.hide()
+
+    def toggle_account_panel(self):
+        if self.account_panel.is_showing():
+            self.account_panel.hide()
+        else:
+            self.account_panel.show_above(self.tk_root, self.build_account_rows())
+
+    def update_account_button_and_panel(self):
+        """Every second: the account button turns red / back when the selected account signs out / in, and the open
+        panel follows logins and logouts finishing in their console windows."""
+        account_names = [account["name"] for account in list_claude_accounts()]
+        button_state = (
+            self.selected_account["name"], tuple(account_names),
+            self.read_login_state(self.selected_account) == "in",
+        )
+        if button_state != self.shown_account_button_state:
+            self.shown_account_button_state = button_state
+            self.floating_label.show_account_name(self.selected_account["name"], account_names, button_state[2])
+        if self.account_panel.is_showing():
+            self.account_panel.update_if_changed(self.build_account_rows())
+
     def open_claude_login_window(self):
-        """Open a console window running "claude auth login" (it opens the browser to sign in), then fetch again
-        once that window closes. You sign in yourself; the app never sees your password."""
+        self.open_claude_auth_window(self.selected_account, "login")
+
+    def open_claude_auth_window(self, account, auth_action):
+        """Open a console window running "claude auth login" (it opens the browser to sign in) or "claude auth
+        logout" for that account, then fetch again once that window closes. You sign in yourself; the app never sees
+        your password."""
         if self.claude_login_window_process and self.claude_login_window_process.poll() is None:
             return  # already open
-        # The selected account's folder: CLAUDE_CONFIG_DIR makes Claude Code keep that login there.
+        # The account's folder: CLAUDE_CONFIG_DIR makes Claude Code keep that login there.
         login_environment = dict(os.environ)
         login_environment.pop("CLAUDE_CONFIG_DIR", None)
-        if Path(self.selected_account["folder"]) != DEFAULT_CLAUDE_CONFIG_FOLDER:
-            login_environment["CLAUDE_CONFIG_DIR"] = self.selected_account["folder"]
+        if Path(account["folder"]) != DEFAULT_CLAUDE_CONFIG_FOLDER:
+            login_environment["CLAUDE_CONFIG_DIR"] = account["folder"]
+        seconds_to_keep_window = 10 if auth_action == "login" else 3
         self.claude_login_window_process = subprocess.Popen(
             [
                 "cmd.exe",
                 "/c",
-                f"title Claude login: {self.selected_account['name']} & claude auth login & timeout /t 10",
+                f"title Claude {auth_action}: {account['name']} & claude auth {auth_action}"
+                f" & timeout /t {seconds_to_keep_window}",
             ],
             creationflags=subprocess.CREATE_NEW_CONSOLE,
             env=login_environment,
@@ -1066,6 +1469,7 @@ class UsageTrayApp:
             self.refresh_requested_event.clear()
             self.refresh()
             seconds_since_last_refresh = 0
+        self.update_account_button_and_panel()
         self.tk_root.after(1000, self.check_requests_every_second, seconds_since_last_refresh + 1)
 
     def watch_for_tray_icon_clicks(self):
@@ -1075,11 +1479,8 @@ class UsageTrayApp:
             self.floating_label.show_at_default_position()
         if self.account_changed_event.is_set():
             self.account_changed_event.clear()
-            show_name = len(list_claude_accounts()) > 1
-            self.floating_label.show_account_name(
-                self.selected_account["name"] if show_name else "",
-                [account["name"] for account in list_claude_accounts()],
-            )
+            self.shown_account_button_state = None  # redraw the account button
+            self.update_account_button_and_panel()
             # The "(3%)" / "(6m)" drops belong to the previous account.
             self.previously_shown_percent_left = None
             self.last_drop_in_percent_left = None
@@ -1097,7 +1498,12 @@ class UsageTrayApp:
         while not self.stop_event.is_set():
             seconds_until_next_fetch = FETCH_INTERVAL_SECONDS
             try:
-                save_usage_snapshot(fetch_live_usage_snapshot(self.selected_account["folder"]))
+                usage_snapshot = fetch_live_usage_snapshot(self.selected_account["folder"])
+                save_usage_snapshot(usage_snapshot)
+                try:
+                    append_usage_history(usage_snapshot)
+                except OSError:
+                    pass  # the graph missing one point is no reason to report a failed fetch
                 self.last_fetch_error_text = None
                 self.login_is_needed = False
             except UsageLoginNeededError as login_error:

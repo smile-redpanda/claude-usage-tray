@@ -24,19 +24,29 @@ Remote: `https://github.com/ekkSoft/claude-usage-tray`. No tests or lint config.
 - 401 / missing token → `UsageLoginNeededError`: the label shows a `🔑 Log in` button (and the tray menu an item)
   that opens a console running `claude auth login` for the selected account; the user signs in themselves.
 - 429 → wait the server's `Retry-After`. Fetching every 60 s got it rate limited for 9+ hours: keep ≥ 5 min.
-- Label (tkinter, borderless, topmost, bottom-right above the taskbar, draggable, right-click → Hide / Quit): blue
-  time-left bar on top, usage-left bar below, and the text row "⚡ 081% (03%)  ⏳ 03h43m (06m)  [circles]  FIN".
+- Label (tkinter, borderless, topmost, bottom-right above the taskbar, draggable, right-click → Hide / Quit), top to
+  bottom: a weekly-limit-left bar in 7 day segments (Claude orange #d97757, the partly used day white); a 7-day segment bar for how much SHOULD be left (time until the weekly reset:
+  whole days only, in gray: the day in progress and empty parts are not drawn; `SevenDaySegmentBar`); the text row
+  "⚡ 081% (03%)  ⏳ 03h43m (06m)  FIN"; a blue time-left bar; the usage-left bar (1 px gaps within each bar pair).
   Numbers have a fixed length so the width never changes; each text sits in a fixed-size slot frame
   (`put_in_slot` / `set_slot_text`); leading zeros are drawn gray (`LeadingZerosGrayText`). No drop yet → gray
   "(00%)" / "(00s)" placeholders. Drop time is 2 digits + s/m/h.
-- Weekly circles (`WeeklyDayCircles`, drawn with Pillow at 4x and shrunk, since tkinter canvas shapes are jagged):
-  3 x 3 grid filled column by column (3 + 3 + 1), the weekly limit LEFT in 7 parts: teal = left, white = the part
-  in use, with a white outlined bar in the empty corner (column 3, rows 2-3) for how much of it is left, dark gray =
-  used. A light gray square marks how many SHOULD be left (days until the weekly reset, rounded up).
+- Each successful fetch also appends a line to `~/.claude/usage-history.jsonl` (`at`, `accountFolder`,
+  `fiveHourPercentUsed`, `fiveHourResetsAt`; kept 24 h). Hovering over the "⚡ 081% (03%)" text or the usage-left bar
+  pops up `UsageHistoryGraph` above the label: 5-hour usage left over the last 10 h (two windows), one column per
+  fetch in the usage colors, gaps > 10 min left empty, dashed blue lines at window resets, hours along the bottom.
 - Accounts: the default login (`~/.claude`) plus extra ones from `~/.claude/usage-tray-settings.json`
   (`defaultAccountName`, `extraAccounts` [{name, folder}], `selectedAccountName`). The user's: "fin"
   (fin.eakalak@gmail.com, `~/.claude`) and "dev" (dev.eakalak@gmail.com, `~/.claude-dev`, i.e. `CLAUDE_CONFIG_DIR`).
-  Tray menu → Account picks one or adds one; clicking the (upper-case) name on the label switches to the next. The
+  Tray menu → Account picks one or adds one. On the label the selected account's (upper-case) name is a button (red
+  unless logged in); it opens `AccountPanel` above the label: click a row to select it (closes the panel); per account a button by its
+  login state (`read_login_state`, from `.credentials.json` expiry times only: `expiresAt` / `refreshTokenExpiresAt`,
+  in ms): "in" → "Log out" (console running `claude auth logout`), "expired" (access token ran out, refresh token
+  still good, or the last fetch got 401) → "Renew" (hidden `claude auth status`, which makes Claude Code renew the
+  token), "out" → "Log in" (console running `claude auth login`); all with that account's `CLAUDE_CONFIG_DIR`. An
+  account not used in Claude Code for hours shows "expired": its token lasts ~8 h. Each row also shows
+  the time left in that account's 5-hour window from its latest line in `usage-history.jsonl` ("1h 25m left" / "n/a", right-aligned).
+  The
   email comes from `.claude.json` (no token in it). Snapshots of another account (by `accountFolder`) are ignored.
 - Tray icon shows the 5-hour % (green < 70, orange ≥ 70, red ≥ 90). Notifications once per 5-hour window at 70%
   and 30 min left (remembered in `~/.claude/usage-tray-shown-warnings.json`). Single instance via a named mutex.
